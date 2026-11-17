@@ -1,0 +1,32 @@
+# Secrets: API keys, database URL. Share settings through .env.example instead.
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Runtime data: databases, saved Dashi accounts and passwords (dashi_config.json),
+# settings, screenshots and downloaded voice models. Created on first run.
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Files the agent creates in its workspace
+workspace/
+
+# Deploy / editor
+.vercel
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# uv.lock stays committed: hosts (Vercel) install the exact locked versions from it.
