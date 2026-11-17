@@ -15,6 +15,7 @@ import uuid
 from langgraph.types import Command
 from sqlalchemy import select
 
+from agent.config import get_settings
 from agent.desktop_env import ensure_default_desktop
 
 from agent.events import add_message, cancellations, emit, set_status
@@ -27,6 +28,19 @@ log = logging.getLogger("abbas.runner")
 
 # Fields that describe one turn; reset on every new request so nothing leaks from the previous one.
 TURN_RESET = {"spec": None, "step_index": 0, "results": [], "attempts": 0, "rounds": 0, "status": "running", "report": ""}
+
+
+def _finish_inline(fut: concurrent.futures.Future) -> None:
+    """On serverless hosts (Vercel) work left running after the response may be frozen or killed, so the
+    request waits for the task to finish (the host's function time limit applies). Locally it returns at once."""
+    from agent.config import ON_SERVERLESS
+
+    if not ON_SERVERLESS:
+        return
+    try:
+        fut.result(timeout=get_settings().serverless_wait_s)
+    except Exception:  # the task records its own failure; the HTTP request still answers
+        pass
 
 
 class TaskRunner:
@@ -111,15 +125,17 @@ class TaskRunner:
             if transcript_meta:
                 s.add(TaskEvent(task_id=task_id, type="transcription_completed", message=request, data=transcript_meta))
 
-        self._worker(conv_id).submit(self._invoke, task_id, conv_id, {
+        fut = self._worker(conv_id).submit(self._invoke, task_id, conv_id, {
             **TURN_RESET, "conversation_id": conv_id, "task_id": task_id, "request": request,
             "source": source, "transcript_confidence": confidence,
         }, True)
+        _finish_inline(fut)
         return task_id, conv_id
 
     def resolve_approval(self, task_id: str, approved: bool) -> None:
         thread_id = self._thread_of(task_id)
-        self._worker(thread_id).submit(self._invoke, task_id, thread_id, Command(resume={"approved": approved}))
+        _finish_inline(self._worker(thread_id).submit(self._invoke, task_id, thread_id,
+                                                      Command(resume={"approved": approved})))
 
     def cancel(self, task_id: str) -> None:
         cancellations.cancel(task_id)

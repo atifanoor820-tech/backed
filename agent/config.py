@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     browser_headless: bool = False  # show the browser Abbas drives
     # Installed browser to drive (fresh profile, your own data untouched): msedge | chrome | "" = bundled Chromium
     browser_channel: str = "msedge"
+    # Remote browser for servers with no Chrome (Vercel): a Chrome DevTools websocket URL, e.g.
+    # wss://production-sfo.browserless.io?token=YOUR_TOKEN. When set, Dashi connects to it instead of launching one.
+    browser_ws_endpoint: str = ""
+    # On serverless hosts a task runs inside its HTTP request; stop waiting a bit before the host's limit (300 s).
+    serverless_wait_s: float = 280.0
     screen_actions: bool = True  # allow PyAutoGUI mouse/keyboard (always approval-gated)
 
     # Apps the agent may launch: "name=path;name2=path2"

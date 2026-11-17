@@ -158,6 +158,24 @@ def _save_accounts(args: SaveAccountsArgs, ctx: ToolContext) -> ToolResult:
                       evidence=[f"{a['account_number']} · {a.get('server') or '?'}" for a in incoming])
 
 
+def _open_browser(p):
+    """(browser, headless). A remote browser (ABBAS_BROWSER_WS_ENDPOINT) when set, else a local Chrome/Edge window.
+    Servers like Vercel have no Chrome at all, so there the remote browser is required."""
+    from agent.config import ON_SERVERLESS
+
+    s = get_settings()
+    if s.browser_ws_endpoint:
+        return p.chromium.connect_over_cdp(s.browser_ws_endpoint, timeout=60000), True
+    if ON_SERVERLESS:
+        raise RuntimeError("this server has no browser. Set ABBAS_BROWSER_WS_ENDPOINT to a remote browser "
+                           "(e.g. wss://production-sfo.browserless.io?token=YOUR_TOKEN) in the backend's env vars")
+    headless = s.browser_headless
+    try:
+        return p.chromium.launch(headless=headless, channel="chrome"), headless
+    except Exception:
+        return p.chromium.launch(headless=headless, channel=s.browser_channel or "chrome"), headless
+
+
 def _remember_given(number: str, broker: str, server: str, password: str, platform: str) -> None:
     """Credentials typed with an add/update command go into the saved accounts too."""
     if number and (password or server):
@@ -543,11 +561,7 @@ def _delete_trading_account(args: DeleteAccountArgs, ctx: ToolContext) -> ToolRe
 
     try:
         with sync_playwright() as p:
-            headless = get_settings().browser_headless
-            try:
-                browser = p.chromium.launch(headless=headless, channel="chrome")
-            except Exception:
-                browser = p.chromium.launch(headless=headless, channel=get_settings().browser_channel or "chrome")
+            browser, headless = _open_browser(p)
 
             page = browser.new_page(viewport={"width": 1366, "height": 850})
             if not headless:
@@ -629,11 +643,7 @@ def _add_trading_account(args: AddAccountArgs, ctx: ToolContext) -> ToolResult:
 
     try:
         with sync_playwright() as p:
-            headless = get_settings().browser_headless
-            try:
-                browser = p.chromium.launch(headless=headless, channel="chrome")
-            except Exception:
-                browser = p.chromium.launch(headless=headless, channel=get_settings().browser_channel or "chrome")
+            browser, headless = _open_browser(p)
 
             page = browser.new_page(viewport={"width": 1366, "height": 850})
             if not headless:
@@ -695,11 +705,7 @@ def _update_trading_account(args: UpdateAccountArgs, ctx: ToolContext) -> ToolRe
 
     try:
         with sync_playwright() as p:
-            headless = get_settings().browser_headless
-            try:
-                browser = p.chromium.launch(headless=headless, channel="chrome")
-            except Exception:
-                browser = p.chromium.launch(headless=headless, channel=get_settings().browser_channel or "chrome")
+            browser, headless = _open_browser(p)
 
             page = browser.new_page(viewport={"width": 1366, "height": 850})
             if not headless:
@@ -734,8 +740,8 @@ def _update_trading_account(args: UpdateAccountArgs, ctx: ToolContext) -> ToolRe
             browser.close()
     except Exception as e:
         return ToolResult(
-            ok=True,
-            summary=f"Dashi checked ShowMyTrades profiles. Action note: {str(e)[:120]}",
+            ok=False,
+            summary=f"Dashi couldn't finish: {str(e)[:200]}",
             data={"target_account": target_acc, "inspected_profiles": inspected_profiles, "actions": actions_taken},
         )
 
@@ -786,11 +792,7 @@ def _check_accounts(args: CheckAccountsArgs, ctx: ToolContext) -> ToolResult:
         _step(ctx.task_id, num, "check", "Check", "pending")
     try:
         with sync_playwright() as p:
-            headless = get_settings().browser_headless
-            try:
-                browser = p.chromium.launch(headless=headless, channel="chrome")
-            except Exception:
-                browser = p.chromium.launch(headless=headless, channel=get_settings().browser_channel or "chrome")
+            browser, headless = _open_browser(p)
             page = browser.new_page(viewport={"width": 1366, "height": 850})
 
             # Profiles where accounts were last seen go first, so most checks need one login.
