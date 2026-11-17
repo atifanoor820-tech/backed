@@ -1,4 +1,4 @@
-"""Settings the user changes from the dashboard while Abbas runs (persisted in data/settings.json).
+"""Settings the user changes from the dashboard while Abbas runs (persisted in the database, app_config).
 
 Values not set here fall back to the .env defaults in agent.config. Also holds the per-app rules
 for desktop.launch_app:
@@ -7,7 +7,6 @@ for desktop.launch_app:
   app_access = "selected"  only apps switched on may be opened
 """
 
-import json
 import logging
 import threading
 from pathlib import Path
@@ -59,21 +58,19 @@ def validate_folders(folders: list) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def _path():
-    return get_settings().data_dir / "settings.json"
+SETTINGS_KEY = "settings"  # table app_config; legacy file data/settings.json is imported once
 
 
 def _read() -> dict:
-    try:
-        return json.loads(_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    from agent import config_store
+
+    return config_store.load(SETTINGS_KEY) or {}
 
 
 def _write(data: dict) -> None:
-    tmp = _path().with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(_path())
+    from agent import config_store
+
+    config_store.save(SETTINGS_KEY, data)
 
 
 def _defaults() -> dict:

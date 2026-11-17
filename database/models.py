@@ -62,3 +62,14 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String(16))  # user | assistant
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AppConfig(Base):
+    """Small JSON documents the app edits at runtime (Dashi profiles/accounts, dashboard settings).
+    Kept in the database, not in files, so they survive restarts and serverless hosts."""
+
+    __tablename__ = "app_config"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

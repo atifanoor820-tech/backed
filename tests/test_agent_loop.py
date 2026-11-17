@@ -22,9 +22,13 @@ from database.session import session_scope
 
 @pytest.fixture(autouse=True)
 def clean_settings():
+    from agent import config_store
+
+    config_store.delete("settings")
     path = get_settings().data_dir / "settings.json"
     path.unlink(missing_ok=True)
     yield
+    config_store.delete("settings")
     path.unlink(missing_ok=True)
 
 

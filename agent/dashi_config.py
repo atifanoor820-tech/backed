@@ -1,16 +1,13 @@
 """Configuration and storage for Dashi (ShowMyTrades trading agent)."""
 
-import json
 import re
 import uuid
-from pathlib import Path
 from typing import Any
 
 from agent.config import get_settings
 
 
-def _config_path() -> Path:
-    return get_settings().data_dir / "dashi_config.json"
+CONFIG_KEY = "dashi_config"  # also the legacy file name data/dashi_config.json, imported once
 
 
 def _default_config() -> dict[str, Any]:
@@ -75,29 +72,24 @@ def _default_config() -> dict[str, Any]:
 
 
 def load_dashi_config() -> dict[str, Any]:
-    path = _config_path()
-    if not path.is_file():
+    """Dashi's profiles and saved accounts, from the database (table app_config, key "dashi_config")."""
+    from agent import config_store
+
+    data = config_store.load(CONFIG_KEY)
+    if data is None:
         data = _default_config()
-        save_dashi_config(data)
-    else:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            for k, v in _default_config().items():
-                data.setdefault(k, v)
-        except Exception:
-            data = _default_config()
-    if get_settings().dashi_only:  # every path, including a fresh server with no config file yet
+        config_store.save(CONFIG_KEY, data)
+    for k, v in _default_config().items():
+        data.setdefault(k, v)
+    if get_settings().dashi_only:  # every path, including a fresh database
         data["active_agent"] = "dashi"
     return data
 
 
 def save_dashi_config(data: dict[str, Any]) -> dict[str, Any]:
-    path = _config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(path)
-    return data
+    from agent import config_store
+
+    return config_store.save(CONFIG_KEY, data)
 
 
 def is_dashi_active() -> bool:

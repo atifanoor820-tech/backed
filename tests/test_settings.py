@@ -13,11 +13,15 @@ APPS = [{"name": "Paint", "id": "Microsoft.Paint!App"}, {"name": "Spotify", "id"
 
 @pytest.fixture(autouse=True)
 def clean_settings(monkeypatch):
+    from agent import config_store
+
+    config_store.delete("settings")
     path = get_settings().data_dir / "settings.json"
     saved = path.read_text() if path.exists() else None
     path.unlink(missing_ok=True)
     monkeypatch.setattr(desktop, "start_apps", lambda max_age_s=600: APPS)
     yield
+    config_store.delete("settings")
     path.unlink(missing_ok=True)
     if saved is not None:
         path.write_text(saved)
