@@ -77,19 +77,18 @@ def _default_config() -> dict[str, Any]:
 def load_dashi_config() -> dict[str, Any]:
     path = _config_path()
     if not path.is_file():
-        cfg = _default_config()
-        save_dashi_config(cfg)
-        return cfg
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        defaults = _default_config()
-        for k, v in defaults.items():
-            data.setdefault(k, v)
-        if get_settings().dashi_only:
-            data["active_agent"] = "dashi"
-        return data
-    except Exception:
-        return _default_config()
+        data = _default_config()
+        save_dashi_config(data)
+    else:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for k, v in _default_config().items():
+                data.setdefault(k, v)
+        except Exception:
+            data = _default_config()
+    if get_settings().dashi_only:  # every path, including a fresh server with no config file yet
+        data["active_agent"] = "dashi"
+    return data
 
 
 def save_dashi_config(data: dict[str, Any]) -> dict[str, Any]:

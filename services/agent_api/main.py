@@ -63,10 +63,14 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Abbas Agent API", version="0.1.0", lifespan=lifespan)
-# The dashboard may land on any free local port (3000 is often taken by another dev server).
-app.add_middleware(CORSMiddleware, allow_origins=get_settings().cors_origins.split(","),
-                   allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
-                   allow_methods=["*"], allow_headers=["*"])
+# Browsers may call this API from the deployed frontend (hardcoded here, no .env needed), its Vercel
+# preview URLs (abbas-<hash>-<team>.vercel.app), or a local dashboard on any port.
+FRONTEND_ORIGINS = ["https://abbas-d97t.vercel.app"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=FRONTEND_ORIGINS + [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://abbas-[a-z0-9-]+\.vercel\.app",
+    allow_methods=["*"], allow_headers=["*"])
 
 
 class TaskIn(BaseModel):

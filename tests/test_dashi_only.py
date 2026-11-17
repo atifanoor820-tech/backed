@@ -39,3 +39,11 @@ def test_flag_off_keeps_abbas(settings):
     settings(dashi_only=False)
     spec, _ = interpret("notepad kholo")
     assert [s.tool for s in spec.plan] == ["desktop.launch_app"]
+
+
+def test_fresh_server_without_config_file_reports_dashi(dashi_only, tmp_path, monkeypatch):
+    import agent.dashi_config as dc
+    from agent.dashi_config import load_dashi_config
+
+    monkeypatch.setattr(dc, "_config_path", lambda: tmp_path / "dashi_config.json")
+    assert load_dashi_config()["active_agent"] == "dashi"
