@@ -19,6 +19,7 @@ from agent.config import get_settings
 from agent.desktop_env import ensure_default_desktop
 
 from agent.events import add_message, cancellations, emit, set_status
+from agent.user_context import as_user, owner_of_conversation
 from agent.graph.workflow import build_graph
 from agent.memory import get_persistence
 from database.models import Conversation, Message, Task, TaskEvent, utcnow
@@ -67,6 +68,10 @@ class TaskRunner:
             return (t.conversation_id if t and t.conversation_id else task_id)
 
     def _invoke(self, task_id: str, thread_id: str, payload, starting: bool = False) -> None:
+        with as_user(owner_of_conversation(thread_id)):
+            self._invoke_as_owner(task_id, thread_id, payload, starting)
+
+    def _invoke_as_owner(self, task_id: str, thread_id: str, payload, starting: bool = False) -> None:
         if sys.platform == "win32":
             ensure_default_desktop()
         try:
@@ -96,12 +101,13 @@ class TaskRunner:
             return conv.id
 
     def create(self, request: str, source: str = "text", confidence: float | None = None,
-               transcript_meta: dict | None = None, conversation_id: str | None = None) -> tuple[str, str]:
+               transcript_meta: dict | None = None, conversation_id: str | None = None,
+               user_id: str | None = None) -> tuple[str, str]:
         task_id = str(uuid.uuid4())
         with session_scope() as s:
             conv = s.get(Conversation, conversation_id) if conversation_id else None
             if conv is None:
-                conv = Conversation(id=conversation_id or str(uuid.uuid4()), title=request[:80])
+                conv = Conversation(id=conversation_id or str(uuid.uuid4()), title=request[:80], user_id=user_id)
                 s.add(conv)
             elif conv.title == "New conversation":
                 conv.title = request[:80]

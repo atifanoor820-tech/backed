@@ -70,7 +70,12 @@ class Settings(BaseSettings):
     max_rounds: int = 10  # plan -> act -> review cycles for one goal
     max_total_steps: int = 40
     history_turns: int = 10  # conversation turns given to the planner
-    user_id: str = "default"  # namespace for long-term memories
+    user_id: str = "default"  # namespace for long-term memories when nobody is signed in
+    # Admin login, created/updated at startup: ABBAS_ADMIN_EMAIL + ABBAS_ADMIN_PASSWORD. The admin sees every
+    # user's conversations, trading accounts and ShowMyTrades profiles.
+    admin_email: str = ""
+    admin_password: str = ""
+    session_days: int = 30
     tool_timeout_s: float = 45.0
 
     # Voice

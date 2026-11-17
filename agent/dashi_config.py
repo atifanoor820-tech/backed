@@ -71,14 +71,27 @@ def _default_config() -> dict[str, Any]:
     }
 
 
-def load_dashi_config() -> dict[str, Any]:
-    """Dashi's profiles and saved accounts, from the database (table app_config, key "dashi_config")."""
+def _key(user_id: str | None = None) -> str:
+    """Each signed-in user has their own profiles and accounts: "dashi_config:<user id>"."""
+    from agent.user_context import current_user_id
+
+    uid = user_id or current_user_id()
+    return f"{CONFIG_KEY}:{uid}" if uid else CONFIG_KEY
+
+
+def load_dashi_config(user_id: str | None = None) -> dict[str, Any]:
+    """Dashi's profiles and saved accounts for the current user, from the database (table app_config)."""
     from agent import config_store
 
-    data = config_store.load(CONFIG_KEY)
+    key = _key(user_id)
+    data = config_store.load(key)
     if data is None:
         data = _default_config()
-        config_store.save(CONFIG_KEY, data)
+        if key != CONFIG_KEY:  # a new user starts with empty profiles, not anyone else's
+            for p in data["profiles"]:
+                p.update(email="", password="")
+            data["trading_accounts"] = []
+        config_store.save(key, data)
     for k, v in _default_config().items():
         data.setdefault(k, v)
     if get_settings().dashi_only:  # every path, including a fresh database
@@ -86,10 +99,10 @@ def load_dashi_config() -> dict[str, Any]:
     return data
 
 
-def save_dashi_config(data: dict[str, Any]) -> dict[str, Any]:
+def save_dashi_config(data: dict[str, Any], user_id: str | None = None) -> dict[str, Any]:
     from agent import config_store
 
-    return config_store.save(CONFIG_KEY, data)
+    return config_store.save(_key(user_id), data)
 
 
 def is_dashi_active() -> bool:

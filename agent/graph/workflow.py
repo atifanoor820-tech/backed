@@ -23,6 +23,14 @@ from agent.tools import TOOLS, ToolContext, compact_catalog
 _pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="abbas-tool")
 
 
+
+def _run_as_owner(run, args, ctx):
+    """Tools run on a worker thread: give it the task owner's identity (their Dashi accounts, their memories)."""
+    from agent.user_context import as_user, owner_of_task
+
+    with as_user(owner_of_task(ctx.task_id)):
+        return run(args, ctx)
+
 def _cancelled(state: GraphState) -> bool:
     return cancellations.is_cancelled(state["task_id"])
 
@@ -134,7 +142,7 @@ def node_execute(state: GraphState) -> GraphState:
     emit(tid, "tool_started", step.description or step.tool, {"tool": step.tool, "args": step.args, "step": idx})
     try:
         args = tool.input_model.model_validate(step.args)
-        fut = _pool.submit(tool.run, args, ToolContext(task_id=tid, step_index=idx))
+        fut = _pool.submit(_run_as_owner, tool.run, args, ToolContext(task_id=tid, step_index=idx))
         result = fut.result(timeout=tool.timeout_s or get_settings().tool_timeout_s)
     except concurrent.futures.TimeoutError:
         result = ToolResult(ok=False, summary=f"{step.tool} timed out after {tool.timeout_s or get_settings().tool_timeout_s:.0f}s")

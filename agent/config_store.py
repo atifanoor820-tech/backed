@@ -23,7 +23,7 @@ def load(key: str) -> dict[str, Any] | None:
         if row is not None:
             return dict(row.value)
     legacy = _legacy_file(key)
-    if legacy.is_file():
+    if ":" not in key and legacy.is_file():
         try:
             data = json.loads(legacy.read_text(encoding="utf-8"))
         except (OSError, ValueError):

@@ -14,7 +14,7 @@ from typing import Literal
 
 from alembic import command
 from alembic.config import Config
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -30,7 +30,9 @@ from agent.interpreter import is_stop_command
 from agent.memory import delete_memory, get_persistence, list_memories, looks_secret, save_memory
 from agent.tools import tool_catalog
 from agent.tools.desktop import app_allowlist
-from database.models import Conversation, Message, Task, TaskEvent
+from agent import auth
+from agent.user_context import as_user
+from database.models import Conversation, Message, Task, TaskEvent, User
 from database.session import session_scope
 from voice.asr import ModelMissing, asr
 from voice.language import detect_language
@@ -55,6 +57,7 @@ async def lifespan(_: FastAPI):
 
     ensure_default_desktop()
     migrate()
+    auth.ensure_admin()
     with session_scope() as s:  # tasks interrupted by a restart cannot resume their thread
         for t in s.scalars(select(Task).where(Task.status.in_(("created", "running")))):
             t.status, t.result = "failed", "Interrupted by a service restart."
@@ -123,6 +126,66 @@ class DashiSwitchIn(BaseModel):
     agent: str = Field(description="'abbas' or 'dashi'")
 
 
+class SignupIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=200)
+    name: str = Field("", max_length=100)
+
+
+class LoginIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=200)
+
+
+def _token(request: Request) -> str | None:
+    h = request.headers.get("authorization", "")
+    if h.lower().startswith("bearer "):
+        return h[7:].strip()
+    return request.query_params.get("token")  # EventSource and <img> can't send headers
+
+
+def current_user(request: Request) -> dict:
+    user = auth.user_for_token(_token(request))
+    if user is None:
+        raise HTTPException(401, "Please log in.")
+    return user
+
+
+def admin_user(user: dict = Depends(current_user)) -> dict:
+    if user["role"] != "admin":
+        raise HTTPException(403, "Only the admin can do this.")
+    return user
+
+
+def scope(request: Request, user: dict = Depends(current_user)) -> dict:
+    """Whose data a request reads or writes. A user: their own. The admin: everyone ("only" None), or one user
+    picked with ?as_user=<id>. "own" is the user that owns what the request creates or edits."""
+    picked = request.query_params.get("as_user") or None
+    if user["role"] == "admin":
+        return {"user": user, "only": picked, "own": picked or user["id"], "admin": True}
+    return {"user": user, "only": user["id"], "own": user["id"], "admin": False}
+
+
+def _conv_allowed(sc: dict, conversation_id: str | None) -> bool:
+    if not conversation_id:
+        return True
+    with session_scope() as s:
+        c = s.get(Conversation, conversation_id)
+        if c is None:
+            return True  # a new conversation id; it will be created for this user
+        return sc["only"] is None or c.user_id == sc["only"]
+
+
+def _task_allowed(sc: dict, task_id: str) -> None:
+    with session_scope() as s:
+        t = s.get(Task, task_id)
+        if t is None:
+            raise HTTPException(404, "task not found")
+        owner = s.scalar(select(Conversation.user_id).where(Conversation.id == t.conversation_id))
+    if sc["only"] is not None and owner != sc["only"]:
+        raise HTTPException(404, "task not found")
+
+
 def _task_dict(t: Task) -> dict:
     return {"id": t.id, "conversation_id": t.conversation_id, "request": t.original_request, "source": t.source,
             "language": t.language,
@@ -135,20 +198,26 @@ def _event_dict(e: TaskEvent) -> dict:
             "created_at": e.created_at.isoformat()}
 
 
-def _cancel_active() -> list[str]:
+def _cancel_active(only: str | None = None) -> list[str]:
     with session_scope() as s:
-        ids = list(s.scalars(select(Task.id).where(Task.status.in_(ACTIVE))))
+        q = select(Task.id).where(Task.status.in_(ACTIVE))
+        if only is not None:
+            q = q.join(Conversation, Conversation.id == Task.conversation_id).where(Conversation.user_id == only)
+        ids = list(s.scalars(q))
     for tid in ids:
         runner.cancel(tid)
     return ids
 
 
 def _submit(text: str, source: str, confidence: float | None, meta: dict | None = None,
-            conversation_id: str | None = None) -> dict:
+            conversation_id: str | None = None, sc: dict | None = None) -> dict:
+    sc = sc or {"only": None, "own": None}
+    if not _conv_allowed(sc, conversation_id):
+        raise HTTPException(404, "conversation not found")
     if is_stop_command(text):
-        return {"stopped": _cancel_active()}
+        return {"stopped": _cancel_active(sc["only"])}
     task_id, conv_id = runner.create(text, source=source, confidence=confidence, transcript_meta=meta,
-                                     conversation_id=conversation_id)
+                                     conversation_id=conversation_id, user_id=sc["own"])
     return {"task_id": task_id, "conversation_id": conv_id}
 
 
@@ -157,11 +226,52 @@ def health():
     return {"ok": True}
 
 
+# --- Accounts --------------------------------------------------------------------------------------
+
+@app.post("/api/auth/signup")
+def signup(body: SignupIn):
+    try:
+        user = auth.create_user(body.email, body.password, body.name)
+    except auth.AuthError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"token": auth.create_session(user["id"]), "user": user}
+
+
+@app.post("/api/auth/login")
+def login(body: LoginIn):
+    try:
+        user = auth.authenticate(body.email, body.password)
+    except auth.AuthError as e:
+        raise HTTPException(401, str(e)) from e
+    return {"token": auth.create_session(user["id"]), "user": user}
+
+
+@app.get("/api/auth/me")
+def me(user: dict = Depends(current_user)):
+    return user
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request):
+    auth.end_session(_token(request))
+    return {"ok": True}
+
+
+@app.get("/api/admin/users")
+def admin_users(_: dict = Depends(admin_user)):
+    users = auth.list_users()
+    with session_scope() as s:
+        counts = dict(s.execute(select(Conversation.user_id, func.count()).group_by(Conversation.user_id)).all())
+    return [{**u, "conversations": counts.get(u["id"], 0)} for u in users]
+
+
 @app.get("/api/status")
-def status():
+def status(sc: dict = Depends(scope)):
     s = get_settings()
     from agent.dashi_config import load_dashi_config
-    dashi_cfg = load_dashi_config()
+    with as_user(sc["own"]):
+        dashi_cfg = load_dashi_config()
+        saved_memories = len(list_memories(runner.store)) if runner else 0
     active_agent = dashi_cfg.get("active_agent", "abbas")
     agent_display = "Dashi" if active_agent == "dashi" else "Abbas"
     agent_nick = "Dashi" if active_agent == "dashi" else "Abbad"
@@ -176,7 +286,7 @@ def status():
         "actions": {"browser_headless": runtime.get("browser_headless"), "screen_actions": runtime.get("screen_actions"),
                     "autonomy": get_level(), "any_app": runtime.get("allow_any_app")},
         "memory": {"backend": get_persistence().backend, "database": "postgres" if s.is_postgres else "sqlite",
-                   "saved": len(list_memories(runner.store)) if runner else 0},
+                   "saved": saved_memories},
         "asr": asr.status(),
         "tts": get_tts().status(),
         "workspaces": [str(p) for p in s.workspace_paths],
@@ -188,14 +298,16 @@ def status():
 
 
 @app.post("/api/tasks")
-def create_task(body: TaskIn):
-    return _submit(body.text.strip(), body.source, body.confidence, conversation_id=body.conversation_id)
+def create_task(body: TaskIn, sc: dict = Depends(scope)):
+    return _submit(body.text.strip(), body.source, body.confidence, conversation_id=body.conversation_id, sc=sc)
 
 
 @app.get("/api/tasks")
-def list_tasks(limit: int = 50, conversation_id: str | None = None):
+def list_tasks(limit: int = 50, conversation_id: str | None = None, sc: dict = Depends(scope)):
     with session_scope() as s:
         q = select(Task).order_by(Task.created_at.desc()).limit(limit)
+        if sc["only"] is not None:
+            q = q.join(Conversation, Conversation.id == Task.conversation_id).where(Conversation.user_id == sc["only"])
         if conversation_id:
             q = q.where(Task.conversation_id == conversation_id)
         return [_task_dict(t) for t in s.scalars(q)]
@@ -204,36 +316,43 @@ def list_tasks(limit: int = 50, conversation_id: str | None = None):
 # --- Conversations (each one is a LangGraph thread = short-term memory) ---------------------------
 
 @app.get("/api/conversations")
-def list_conversations(limit: int = 50):
+def list_conversations(limit: int = 50, sc: dict = Depends(scope)):
     with session_scope() as s:
         counts = dict(s.execute(select(Task.conversation_id, func.count()).group_by(Task.conversation_id)).all())
-        convs = s.scalars(select(Conversation).order_by(Conversation.updated_at.desc()).limit(limit))
-        return [{"id": c.id, "title": c.title, "updated_at": c.updated_at.isoformat(), "tasks": counts.get(c.id, 0)}
+        q = select(Conversation).order_by(Conversation.updated_at.desc()).limit(limit)
+        if sc["only"] is not None:
+            q = q.where(Conversation.user_id == sc["only"])
+        convs = list(s.scalars(q))
+        emails = dict(s.execute(select(User.id, User.email)).all()) if sc["admin"] else {}
+        return [{"id": c.id, "title": c.title, "updated_at": c.updated_at.isoformat(), "tasks": counts.get(c.id, 0),
+                 **({"owner": emails.get(c.user_id, "(no owner)")} if sc["admin"] else {})}
                 for c in convs]
 
 
 @app.post("/api/conversations")
-def new_conversation():
+def new_conversation(sc: dict = Depends(scope)):
     with session_scope() as s:
-        c = Conversation(id=str(uuid.uuid4()))
+        c = Conversation(id=str(uuid.uuid4()), user_id=sc["own"])
         s.add(c)
+        s.flush()  # fills the column defaults (updated_at)
         return {"id": c.id, "title": c.title, "updated_at": c.updated_at.isoformat(), "tasks": 0}
 
 
 @app.get("/api/conversations/{conversation_id}")
-def get_conversation(conversation_id: str):
+def get_conversation(conversation_id: str, sc: dict = Depends(scope)):
     with session_scope() as s:
         c = s.get(Conversation, conversation_id)
-        if c is None:
+        if c is None or (sc["only"] is not None and c.user_id != sc["only"]):
             raise HTTPException(404, "conversation not found")
         out = {"id": c.id, "title": c.title}
     return {**out, **runner.thread_state(conversation_id)}
 
 
 @app.delete("/api/conversations/{conversation_id}")
-def delete_conversation(conversation_id: str):
+def delete_conversation(conversation_id: str, sc: dict = Depends(scope)):
     with session_scope() as s:
-        if s.get(Conversation, conversation_id) is None:
+        c = s.get(Conversation, conversation_id)
+        if c is None or (sc["only"] is not None and c.user_id != sc["only"]):
             raise HTTPException(404, "conversation not found")
         task_ids = list(s.scalars(select(Task.id).where(Task.conversation_id == conversation_id)))
         if s.scalar(select(func.count()).where(Task.conversation_id == conversation_id, Task.status.in_(ACTIVE))):
@@ -252,12 +371,12 @@ def delete_conversation(conversation_id: str):
 # --- Autonomy -------------------------------------------------------------------------------------
 
 @app.get("/api/settings/autonomy")
-def autonomy():
+def autonomy(_: dict = Depends(current_user)):
     return {"level": get_level()}
 
 
 @app.put("/api/settings/autonomy")
-def update_autonomy(body: AutonomyIn):
+def update_autonomy(body: AutonomyIn, _: dict = Depends(admin_user)):
     return {"level": set_level(body.level)}
 
 
@@ -283,12 +402,12 @@ def _settings_view() -> dict:
 
 
 @app.get("/api/settings")
-def read_settings():
+def read_settings(_: dict = Depends(current_user)):
     return _settings_view()
 
 
 @app.patch("/api/settings")
-def change_settings(body: SettingsIn):
+def change_settings(body: SettingsIn, _: dict = Depends(admin_user)):
     changes = body.model_dump(exclude_none=True)
     if not changes:
         raise HTTPException(422, "nothing to change")
@@ -303,14 +422,14 @@ def change_settings(body: SettingsIn):
 
 
 @app.get("/api/apps")
-async def list_apps():
+async def list_apps(_: dict = Depends(current_user)):
     apps = await run_in_threadpool(app_catalog)
     return {"access": runtime.get("app_access"), "any_app": runtime.get("allow_any_app"),
             "allowed": sum(a["allowed"] for a in apps), "total": len(apps), "apps": apps}
 
 
 @app.put("/api/apps")
-def change_apps(body: AppRulesIn):
+def change_apps(body: AppRulesIn, _: dict = Depends(admin_user)):
     runtime.set_app_rules(body.rules)
     return {"ok": True, "changed": len(body.rules)}
 
@@ -318,31 +437,32 @@ def change_apps(body: AppRulesIn):
 # --- Dashi (ShowMyTrades Agent) -----------------------------------------------------------------
 
 @app.get("/api/dashi")
-def get_dashi():
+def get_dashi(sc: dict = Depends(scope)):
     from agent.dashi_config import load_dashi_config
-    return load_dashi_config()
+    return load_dashi_config(sc["own"])
 
 
 @app.put("/api/dashi")
-def update_dashi(body: DashiConfigIn):
+def update_dashi(body: DashiConfigIn, sc: dict = Depends(scope)):
     from agent.dashi_config import load_dashi_config, save_dashi_config
-    cfg = load_dashi_config()
+    cfg = load_dashi_config(sc["own"])
     data = body.model_dump(exclude_none=True)
     cfg.update(data)
-    save_dashi_config(cfg)
-    return cfg
+    save_dashi_config(cfg, sc["own"])
+    return load_dashi_config(sc["own"])
 
 
 @app.post("/api/dashi/accounts/import")
-def import_dashi_accounts(body: DashiImportIn):
+def import_dashi_accounts(body: DashiImportIn, sc: dict = Depends(scope)):
     from agent.dashi_config import load_dashi_config, parse_accounts_text, upsert_trading_accounts
     parsed = parse_accounts_text(body.text)
-    added, updated = upsert_trading_accounts(parsed)
-    return {"found": len(parsed), "added": added, "updated": updated, "config": load_dashi_config()}
+    with as_user(sc["own"]):
+        added, updated = upsert_trading_accounts(parsed)
+        return {"found": len(parsed), "added": added, "updated": updated, "config": load_dashi_config()}
 
 
 @app.post("/api/dashi/switch")
-def switch_dashi(body: DashiSwitchIn):
+def switch_dashi(body: DashiSwitchIn, _: dict = Depends(admin_user)):
     from agent.dashi_config import set_active_agent
     try:
         name = set_active_agent(body.agent)
@@ -354,26 +474,31 @@ def switch_dashi(body: DashiSwitchIn):
 # --- Long-term memory (LangGraph store) ----------------------------------------------------------
 
 @app.get("/api/memories")
-def memories():
-    return list_memories(runner.store)
+def memories(sc: dict = Depends(scope)):
+    with as_user(sc["own"]):
+        return list_memories(runner.store)
 
 
 @app.post("/api/memories")
-def add_memory(body: MemoryIn):
+def add_memory(body: MemoryIn, sc: dict = Depends(scope)):
     if looks_secret(body.text):
         raise HTTPException(422, "That looks like a password, key or card number; Abbas does not store those.")
-    return save_memory(runner.store, body.text)
+    with as_user(sc["own"]):
+        return save_memory(runner.store, body.text)
 
 
 @app.delete("/api/memories/{memory_id}")
-def remove_memory(memory_id: str):
-    if not delete_memory(runner.store, memory_id):
+def remove_memory(memory_id: str, sc: dict = Depends(scope)):
+    with as_user(sc["own"]):
+        found = delete_memory(runner.store, memory_id)
+    if not found:
         raise HTTPException(404, "memory not found")
     return {"ok": True}
 
 
 @app.get("/api/tasks/{task_id}")
-def get_task(task_id: str):
+def get_task(task_id: str, sc: dict = Depends(scope)):
+    _task_allowed(sc, task_id)
     with session_scope() as s:
         t = s.get(Task, task_id)
         if t is None:
@@ -383,7 +508,8 @@ def get_task(task_id: str):
 
 
 @app.post("/api/tasks/{task_id}/approve")
-def approve(task_id: str, body: ApprovalIn):
+def approve(task_id: str, body: ApprovalIn, sc: dict = Depends(scope)):
+    _task_allowed(sc, task_id)
     with session_scope() as s:
         t = s.get(Task, task_id)
         if t is None:
@@ -396,18 +522,20 @@ def approve(task_id: str, body: ApprovalIn):
 
 
 @app.post("/api/tasks/{task_id}/cancel")
-def cancel(task_id: str):
+def cancel(task_id: str, sc: dict = Depends(scope)):
+    _task_allowed(sc, task_id)
     runner.cancel(task_id)
     return {"ok": True}
 
 
 @app.post("/api/stop")
-def stop_all():
-    return {"stopped": _cancel_active()}
+def stop_all(sc: dict = Depends(scope)):
+    return {"stopped": _cancel_active(sc["only"])}
 
 
 @app.delete("/api/tasks/{task_id}")
-def delete_task(task_id: str):
+def delete_task(task_id: str, sc: dict = Depends(scope)):
+    _task_allowed(sc, task_id)
     with session_scope() as s:
         t = s.get(Task, task_id)
         if t is None:
@@ -428,8 +556,9 @@ def delete_task(task_id: str):
 
 
 @app.get("/api/events/stream")
-async def stream(after: int = 0):
-    """Server-sent events built from the persisted event log."""
+async def stream(after: int = 0, sc: dict = Depends(scope)):
+    """Server-sent events built from the persisted event log, limited to the signed-in user's tasks."""
+    only = sc["only"]
 
     async def gen():
         last = after
@@ -439,10 +568,17 @@ async def stream(after: int = 0):
         idle = 0
         while True:
             with session_scope() as s:
-                rows = [_event_dict(e) for e in s.scalars(
-                    select(TaskEvent).where(TaskEvent.id > last).order_by(TaskEvent.id).limit(200))]
+                q = select(TaskEvent).where(TaskEvent.id > last).order_by(TaskEvent.id).limit(200)
+                rows = [_event_dict(e) for e in s.scalars(q)]
+                mine = None
+                if only is not None and rows:
+                    mine = set(s.scalars(select(Task.id).join(Conversation, Conversation.id == Task.conversation_id)
+                                         .where(Conversation.user_id == only,
+                                                Task.id.in_({r["task_id"] for r in rows}))))
             for r in rows:
                 last = r["id"]
+                if mine is not None and r["task_id"] not in mine:
+                    continue
                 yield f"id: {r['id']}\nevent: task_event\ndata: {json.dumps(r)}\n\n"
             idle = 0 if rows else idle + 1
             if idle and idle % 120 == 0:
@@ -454,9 +590,10 @@ async def stream(after: int = 0):
 
 
 @app.get("/api/screenshots/{name}")
-def screenshot(name: str):
-    if not re.fullmatch(r"[0-9a-f-]{36}_\d+(?:_[a-z]+)?\.png", name):
+def screenshot(name: str, sc: dict = Depends(scope)):
+    if not re.fullmatch(r"[0-9a-f-]{36}_[\w-]+\.png", name):
         raise HTTPException(400, "bad name")
+    _task_allowed(sc, name[:36])
     path = get_settings().data_dir / "screenshots" / name
     if not path.exists():
         raise HTTPException(404, "not found")
@@ -465,7 +602,7 @@ def screenshot(name: str):
 
 @app.post("/api/voice/transcribe")
 async def transcribe(audio: UploadFile = File(...), submit: bool = Form(False),
-                     conversation_id: str | None = Form(None)):
+                     conversation_id: str | None = Form(None), sc: dict = Depends(scope)):
     data = await audio.read()
     if not data:
         raise HTTPException(400, "empty audio")
@@ -484,12 +621,12 @@ async def transcribe(audio: UploadFile = File(...), submit: bool = Form(False),
     elif submit:
         meta = {"confidence": tr.confidence, "language": tr.language, "language_probability": tr.language_probability,
                 "duration_s": tr.duration_s, "elapsed_s": tr.elapsed_s, "segments": tr.segments}
-        out.update(_submit(tr.text, "voice", tr.confidence, meta, conversation_id=conversation_id))
+        out.update(_submit(tr.text, "voice", tr.confidence, meta, conversation_id=conversation_id, sc=sc))
     return out
 
 
 @app.post("/api/voice/speak")
-async def speak(body: SpeakIn):
+async def speak(body: SpeakIn, _: dict = Depends(current_user)):
     tts = get_tts()
     try:
         wav = await run_in_threadpool(tts.synthesize, speakable(body.text))

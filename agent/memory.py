@@ -68,7 +68,9 @@ def get_persistence() -> Persistence:
 
 
 def _ns() -> tuple[str, str]:
-    return ("memories", get_settings().user_id)
+    from agent.user_context import current_user_id
+
+    return ("memories", current_user_id() or get_settings().user_id)
 
 
 def list_memories(store: BaseStore, limit: int = 100) -> list[dict]:
